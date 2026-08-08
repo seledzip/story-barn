@@ -92,6 +92,12 @@ const state = {
   channels: loadJSON("channels", []),
   discoverLoading: false,
   discoverError: "",
+  batchContentType: CONTENT_TYPES[0],
+  batchRunning: false,
+  batchChannelId: null,
+  batchCurrent: 0,
+  batchTotal: 0,
+  batchErrors: 0,
   contentType: CONTENT_TYPES[0],
   topic: "",
   context: "",
@@ -102,6 +108,15 @@ const state = {
 };
 
 function setState(patch) { Object.assign(state, patch); render(); }
+
+// 생성 + 자동 저장 (수동 저장 버튼 없이 항상 자동으로 곳간에 쌓입니다)
+async function generateAndSave(topic, contentType, context) {
+  const result = await generateScriptViaAPI(contentType, topic, context);
+  const entry = { ...result, topic, contentType, savedAt: Date.now() };
+  state.saved = [entry, ...state.saved];
+  saveJSON("scripts", state.saved);
+  return entry;
+}
 
 // ---------- 렌더링 ----------
 function render() {
@@ -164,9 +179,19 @@ function renderDiscover() {
 
     if (state.channels.length === 0) {
       html += `<div class="card center">아직 등록된 채널이 없습니다. 시니어 타겟 채널을 추가하면 구독자 대비 조회수가 높은 영상을 자동으로 찾아드립니다.</div>`;
+    } else {
+      html += `
+        <div class="card" style="padding:12px 18px">
+          <label class="field-label">전체 자동 생성 시 사용할 콘텐츠 유형</label>
+          <select id="batch-content-type" style="max-width:220px">
+            ${CONTENT_TYPES.map((t) => `<option value="${esc(t)}" ${t === state.batchContentType ? "selected" : ""}>${esc(t)}</option>`).join("")}
+          </select>
+          <p class="hint">채널의 "전체 자동 생성"을 누르면 이 유형으로 모든 영상의 대본을 자동으로 짓고 곳간에 저장합니다. 영상 수만큼 AI 호출 비용이 발생합니다.</p>
+        </div>`;
     }
 
     state.channels.forEach((ch, ci) => {
+      const isBatching = state.batchRunning && state.batchChannelId === ch.id;
       html += `
         <div class="card">
           <div class="channel-header">
@@ -175,10 +200,12 @@ function renderDiscover() {
               <div class="channel-sub">구독자 ${fmtNum(ch.subscriberCount)}명</div>
             </div>
             <div class="row" style="margin-top:0">
-              <button class="btn ghost small" data-refresh="${ch.id}">새로고침</button>
-              <button class="btn ghost small danger" data-remove="${ch.id}">삭제</button>
+              <button class="btn small" data-batch="${ch.id}" ${state.batchRunning ? "disabled" : ""}>${isBatching ? `생성 중 ${state.batchCurrent}/${state.batchTotal}` : "전체 자동 생성"}</button>
+              <button class="btn ghost small" data-refresh="${ch.id}" ${state.batchRunning ? "disabled" : ""}>새로고침</button>
+              <button class="btn ghost small danger" data-remove="${ch.id}" ${state.batchRunning ? "disabled" : ""}>삭제</button>
             </div>
           </div>
+          ${isBatching ? `<p class="hint">자동으로 대본을 짓고 곳간에 저장하는 중입니다. 이 화면을 벗어나지 마세요… (오류 ${state.batchErrors}건)</p>` : ""}
           <div>
             ${ch.videos.length === 0 ? `<div class="hint">최근 영상을 찾을 수 없습니다.</div>` : ""}
             ${ch.videos.map((v) => `
@@ -188,7 +215,7 @@ function renderDiscover() {
                   <a class="video-title" href="${esc(v.url)}" target="_blank" rel="noreferrer">${esc(v.title)}</a>
                   <div class="video-meta">조회수 ${fmtNum(v.views)}회</div>
                 </div>
-                <button class="btn ghost small" data-use-topic="${esc(v.title)}">대본 짓기</button>
+                <button class="btn ghost small" data-use-topic="${esc(v.title)}" ${state.batchRunning ? "disabled" : ""}>대본 짓기</button>
               </div>
             `).join("")}
           </div>
@@ -217,6 +244,7 @@ function renderWrite() {
         <textarea id="context-input" rows="4">${esc(state.context)}</textarea>
       </div>
       <button class="btn" id="generate-btn" ${state.genLoading || !state.topic.trim() ? "disabled" : ""}>${state.genLoading ? "짓는 중…" : "대본 기획안 만들기"}</button>
+      <p class="hint">기획안이 완성되면 자동으로 곳간에 저장됩니다. 별도로 저장 버튼을 누를 필요 없습니다.</p>
       ${state.genError ? `<p class="error-text">${esc(state.genError)}</p>` : ""}
     </div>`;
 
@@ -225,9 +253,7 @@ function renderWrite() {
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center">
           <span class="patch" style="background:${patchColor(3)}">기획안</span>
-          <div class="row" style="margin-top:0">
-            <button class="btn" id="save-script-btn" style="padding:6px 12px;font-size:12px">곳간에 저장</button>
-          </div>
+          <span style="font-size:12px;color:var(--jade);font-weight:700">✓ 곳간에 자동 저장됨</span>
         </div>
         ${renderScriptBody(state.script)}
       </div>`;
@@ -301,12 +327,13 @@ function attachTabHandlers() {
     });
   });
   document.querySelectorAll("[data-use-topic]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.topic = btn.dataset.useTopic;
-      state.script = null;
-      state.tab = "write";
-      render();
-    });
+    btn.addEventListener("click", () => useAsTopic(btn.dataset.useTopic));
+  });
+
+  const batchCT = document.getElementById("batch-content-type");
+  if (batchCT) batchCT.addEventListener("change", (e) => (state.batchContentType = e.target.value));
+  document.querySelectorAll("[data-batch]").forEach((btn) => {
+    btn.addEventListener("click", () => batchGenerateForChannel(btn.dataset.batch));
   });
 
   // 대본 짓기
@@ -321,13 +348,6 @@ function attachTabHandlers() {
   if (contextInput) contextInput.addEventListener("input", (e) => (state.context = e.target.value));
   const genBtn = document.getElementById("generate-btn");
   if (genBtn) genBtn.addEventListener("click", handleGenerate);
-  const saveScriptBtn = document.getElementById("save-script-btn");
-  if (saveScriptBtn) saveScriptBtn.addEventListener("click", () => {
-    const entry = { ...state.script, topic: state.topic, contentType: state.contentType, savedAt: Date.now() };
-    state.saved = [entry, ...state.saved];
-    saveJSON("scripts", state.saved);
-    render();
-  });
 
   // 보관함
   document.querySelectorAll("[data-delete-saved]").forEach((btn) => {
@@ -381,14 +401,53 @@ async function handleGenerate() {
   state.script = null;
   render();
   try {
-    const result = await generateScriptViaAPI(state.contentType, state.topic, state.context);
-    state.script = result;
+    const entry = await generateAndSave(state.topic, state.contentType, state.context);
+    state.script = entry;
   } catch (e) {
     state.genError = e.message || "대본 생성에 실패했습니다. 잠시 후 다시 시도해주세요.";
   } finally {
     state.genLoading = false;
     render();
   }
+}
+
+// 소재 탐색 탭에서 "대본 짓기"를 누르면 곧바로 대본 짓기 탭으로 이동해
+// 별도 클릭 없이 즉시 생성을 시작합니다 (자동 완성 + 자동 저장).
+function useAsTopic(title) {
+  state.topic = title;
+  state.script = null;
+  state.tab = "write";
+  render();
+  handleGenerate();
+}
+
+// 채널의 모든 영상에 대해 순서대로 대본을 자동 생성하고 곳간에 저장합니다.
+async function batchGenerateForChannel(channelId) {
+  if (state.batchRunning) return;
+  const ch = state.channels.find((c) => c.id === channelId);
+  if (!ch || ch.videos.length === 0) return;
+
+  state.batchRunning = true;
+  state.batchChannelId = channelId;
+  state.batchCurrent = 0;
+  state.batchTotal = ch.videos.length;
+  state.batchErrors = 0;
+  render();
+
+  for (const v of ch.videos) {
+    try {
+      await generateAndSave(v.title, state.batchContentType, "");
+    } catch (e) {
+      state.batchErrors += 1;
+      console.error("배치 생성 실패:", v.title, e);
+    }
+    state.batchCurrent += 1;
+    render();
+  }
+
+  state.batchRunning = false;
+  state.batchChannelId = null;
+  render();
 }
 
 render();
