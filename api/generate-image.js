@@ -29,7 +29,41 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const fullPrompt = `${prompt}. Warm cinematic photo, soft natural lighting, realistic photography style, Korean everyday life, no text, no watermark, no logo.`;
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  let imagePrompt = String(prompt).trim();
+
+  // 1단계: 대본 문장을 "시니어 다큐멘터리 사진" 스타일의 정확한 영어 프롬프트로 변환
+  // (한국어 프롬프트는 이미지 생성 모델이 잘 이해하지 못하고, 기획 노트 말투("~를 보여준다")도
+  //  그대로 넣으면 엉뚱한 결과가 나오기 때문입니다.)
+  if (anthropicKey) {
+    try {
+      const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: 200,
+          system:
+            "You convert Korean YouTube scene-planning notes into a short English image-generation prompt for a realistic documentary-style photo. Unless the scene text clearly says otherwise, the subject should be a Korean senior citizen (60s-70s), photographed respectfully and authentically — never a young person, never a K-drama or fashion-model style portrait. Describe one concrete visual moment (setting, subject, action, mood, lighting) in under 40 words. Output ONLY the prompt text, nothing else — no quotes, no explanation, no markdown.",
+          messages: [{ role: "user", content: `장면 설명: ${imagePrompt}` }],
+        }),
+      });
+      const claudeData = await claudeRes.json();
+      const text = (claudeData.content || [])
+        .map((b) => (b.type === "text" ? b.text : ""))
+        .join("")
+        .trim();
+      if (text) imagePrompt = text;
+    } catch (e) {
+      // 실패하면 원문 텍스트로 그대로 진행합니다.
+    }
+  }
+
+  const fullPrompt = `${imagePrompt}. Realistic documentary photography, warm natural lighting, dignified and authentic, no text, no watermark, no logo.`;
 
   try {
     const predictionRes = await fetch(
